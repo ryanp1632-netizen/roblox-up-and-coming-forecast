@@ -136,7 +136,8 @@ export function featuresAt(reads, i) {
       if (a && b) g24 = Math.log(a / b);
     }
     const [age, pk] = life.get(id);
-    out.set(id, [lr, v24, v6, g24, Math.log(1 + age), lr - pk]);
+    const pl = r.playing.get(id);
+    out.set(id, [lr, v24, v6, g24, Math.log(1 + age), lr - pk, pl ? Math.log(pl) - 9 : 0]);
   }
   return out;
 }
@@ -255,6 +256,7 @@ export function forecast(reads, params = DEFAULTS) {
 }
 
 const REG_HORIZONS = [3, 12, 24, 48, 72];
+const NX = 8; // regression inputs: 1, log rank, v24, v6, g24, log chart age, below peak, log players
 
 /** Solves (A + lambda I) x = b by Gauss-Jordan elimination (A symmetric positive semi-definite, small). */
 function ridgeSolve(A, b, lambda) {
@@ -275,7 +277,7 @@ function ridgeSolve(A, b, lambda) {
 }
 
 function regX(f) {
-  return [1, f[0] - Math.log(10), f[1], f[2], f[3], f[4] - 4, f[5]];
+  return [1, f[0] - Math.log(10), f[1], f[2], f[3], f[4] - 4, f[5], f[6]];
 }
 
 /**
@@ -290,8 +292,8 @@ export function fitDrift(reads, P) {
   const maxLr = Math.log(P.regMaxRank);
   for (const H of REG_HORIZONS) {
     const tol = Math.max(1.5, 0.2 * H);
-    const A = Array.from({ length: 7 }, () => new Array(7).fill(0));
-    const b = new Array(7).fill(0);
+    const A = Array.from({ length: NX }, () => new Array(NX).fill(0));
+    const b = new Array(NX).fill(0);
     const rows = [];
     for (let i = 0; i < reads.length - 1; i++) {
       let j = -1;
@@ -310,14 +312,14 @@ export function fitDrift(reads, P) {
         const x = regX(f);
         const y = lnRank(reads[j], id) - f[0];
         rows.push([x, y, w]);
-        for (let a = 0; a < 7; a++) { b[a] += w * x[a] * y; for (let c = 0; c < 7; c++) A[a][c] += w * x[a] * x[c]; }
+        for (let a = 0; a < NX; a++) { b[a] += w * x[a] * y; for (let c = 0; c < NX; c++) A[a][c] += w * x[a] * x[c]; }
       }
     }
     if (rows.length < 60) { fits.push(null); continue; }
     const wsum = rows.reduce((s, r) => s + r[2], 0);
     const beta = ridgeSolve(A, b, P.regRidge * wsum);
     let ad = 0;
-    for (const [x, y, w] of rows) { let yh = 0; for (let a = 0; a < 7; a++) yh += x[a] * beta[a]; ad += w * Math.abs(y - yh); }
+    for (const [x, y, w] of rows) { let yh = 0; for (let a = 0; a < NX; a++) yh += x[a] * beta[a]; ad += w * Math.abs(y - yh); }
     fits.push({ H, beta, sd: 1.2533 * ad / wsum });
   }
   return fits;

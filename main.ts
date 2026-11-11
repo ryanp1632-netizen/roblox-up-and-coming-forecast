@@ -23,17 +23,27 @@ const OFF_RANK = 130; // the rank a game off the chart counts as
 
 export const DEFAULTS = {
   bins: [0, 6, 12, 24, 36, 48, 60, 72],
-  bwRank: 0.35, // kernel bandwidth on ln(rank)
+  bwRank: 0.8, // kernel bandwidth on ln(rank)
   bwV24: 0.6, // on the ~24 h log-rank change
   bwV6: 0.5, // on the ~6 h log-rank change
-  bwG24: 0.8, // on the ~24 h log player growth
-  recencyHalfLife: 120, // hours: an origin this old weighs half
+  bwG24: 0.5, // on the ~24 h log player growth
+  bwAge: 50, // on ln(1 + hours since the game first showed on the chart)
+  bwPeak: 0.4, // on how far (log rank) the game sits below its best rank so far
+  recencyHalfLife: 1000, // hours: an origin this old weighs half
   originGapCap: 6, // hours: an origin weighs its gap to the previous origin, capped here
-  priorWeight: 0.5, // pseudo-weight of the rank-only prior in each kernel estimate
-  floor: 0.0008, // least probability of a named game at a place
-  poolFloor: 0.02, // least unnamed share of a place
-  poolScale: 1.0, // multiplier on the learned unnamed share
+  priorWeight: 2, // pseudo-weight of the rank-only prior in each kernel estimate
+  floor: 0.0002, // least probability of a named game at a place
+  poolFloor: 0.04, // least unnamed share of a place
+  poolScale: 1.3, // multiplier on the learned unnamed share
   temp: 1.0, // power applied to the named probabilities before normalising (1 = none)
+  mixDiffusion: 0.5, // weight of the parametric log-rank diffusion component
+  dDrift: 0.02, // log-rank drift per hour (games sink as they age)
+  dMeanRev: 0.4, // pull toward rank 15 over a day
+  dMom24: 0.5, // share of the last 24 h log-rank change that carries on
+  dMomHours: 24, // for this many hours
+  dMom6: 0.2, // share of the last 6 h change that carries on (over 6 h)
+  dS0: 0.25, // log-rank spread at horizon 0
+  dS1: 0.12, // and its growth per sqrt(hour)
 };
 
 /** Parses history.ndjson text into reads sorted by time: {t (hours), ids (in rank order), rank Map, playing Map}. */
@@ -80,11 +90,32 @@ function lagIndex(reads, i, lag, tol) {
   return best;
 }
 
-/** Feature vectors of every game on read i: Map id -> [lnRank, v24, v6, g24]. */
+/** First-seen time and best log rank so far of every game, read by read: computed once per history. */
+function lifeTable(reads) {
+  if (reads._life) return reads._life;
+  const first = new Map();
+  const peak = new Map();
+  const life = [];
+  for (const r of reads) {
+    for (const id of r.ids) {
+      if (!first.has(id)) first.set(id, r.t);
+      const lr = Math.log(r.rank.get(id));
+      if (!peak.has(id) || lr < peak.get(id)) peak.set(id, lr);
+    }
+    const snap = new Map();
+    for (const id of r.ids) snap.set(id, [r.t - first.get(id), peak.get(id)]);
+    life.push(snap);
+  }
+  reads._life = life;
+  return life;
+}
+
+/** Feature vectors of every game on read i: Map id -> [lnRank, v24, v6, g24, lnChartAge, belowPeak]. */
 export function featuresAt(reads, i) {
   const r = reads[i];
   const j24 = lagIndex(reads, i, 24, 10);
   const j6 = lagIndex(reads, i, 6, 3.5);
+  const life = lifeTable(reads)[i];
   const out = new Map();
   for (const id of r.ids) {
     const lr = lnRank(r, id);
@@ -96,7 +127,8 @@ export function featuresAt(reads, i) {
       const b = reads[j24].playing.get(id);
       if (a && b) g24 = Math.log(a / b);
     }
-    out.set(id, [lr, v24, v6, g24]);
+    const [age, pk] = life.get(id);
+    out.set(id, [lr, v24, v6, g24, Math.log(1 + age), lr - pk]);
   }
   return out;
 }
@@ -155,7 +187,7 @@ export function forecast(reads, params = DEFAULTS) {
   const nb = P.bins.length - 1;
   const { obs, pool } = buildObservations(reads, P);
   const feats = featuresAt(reads, last);
-  const ib = [1 / P.bwRank, 1 / P.bwV24, 1 / P.bwV6, 1 / P.bwG24];
+  const ib = [1 / P.bwRank, 1 / P.bwV24, 1 / P.bwV6, 1 / P.bwG24, 1 / P.bwAge, 1 / P.bwPeak];
   const prob = new Map(ids.map((id) => [id, new Float64Array(PLACES)]));
   const poolP = new Float64Array(PLACES);
   let wbTotal = 0;
@@ -177,7 +209,9 @@ export function forecast(reads, params = DEFAULTS) {
         const d1 = (x[1] - q[1]) * ib[1];
         const d2 = (x[2] - q[2]) * ib[2];
         const d3 = (x[3] - q[3]) * ib[3];
-        const w = ob.w * Math.exp(-0.5 * (d0 * d0 + d1 * d1 + d2 * d2 + d3 * d3));
+        const d4 = (x[4] - q[4]) * ib[4];
+        const d5 = (x[5] - q[5]) * ib[5];
+        const w = ob.w * Math.exp(-0.5 * (d0 * d0 + d1 * d1 + d2 * d2 + d3 * d3 + d4 * d4 + d5 * d5));
         if (w < 1e-12) continue;
         wsum += w;
         if (ob.y) for (let k = 0; k < PLACES; k++) acc[k] += w * ob.y[k];
@@ -193,7 +227,52 @@ export function forecast(reads, params = DEFAULTS) {
     for (const v of prob.values()) for (let k = 0; k < PLACES; k++) v[k] /= wbTotal;
     for (let k = 0; k < PLACES; k++) poolP[k] /= wbTotal;
   }
+  if (P.mixDiffusion > 0) {
+    const dif = diffusion(ids, feats, P);
+    for (const id of ids) {
+      const a = prob.get(id);
+      const d = dif.get(id);
+      for (let k = 0; k < PLACES; k++) a[k] = (1 - P.mixDiffusion) * a[k] + P.mixDiffusion * d[k] * (1 - poolP[k]);
+    }
+  }
   return finish(ids, prob, poolP, P);
+}
+
+/** Standard normal CDF (Abramowitz-Stegun 7.1.26 on erf; error below 1.5e-7). */
+function phi(x) {
+  const z = Math.abs(x) / Math.SQRT2;
+  const t = 1 / (1 + 0.3275911 * z);
+  const e = 1 - ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * Math.exp(-z * z);
+  return x >= 0 ? 0.5 * (1 + e) : 0.5 * (1 - e);
+}
+
+/**
+ * A parametric second opinion: each game's log rank drifts (games sink as they age, recent climbers keep climbing
+ * for a while) and spreads with the horizon; its place probabilities are the Gaussian mass on each place's log-rank
+ * interval, averaged over the window's hours. Places are re-normalised later, with the other component.
+ */
+function diffusion(ids, feats, P) {
+  const out = new Map();
+  for (const id of ids) {
+    const [lr, v24, v6] = feats.get(id);
+    const acc = new Float64Array(PLACES);
+    let n = 0;
+    for (let h = 1.5; h < 72; h += 3) {
+      const m = lr + P.dDrift * h + P.dMeanRev * (1 - Math.exp(-h / 24)) * (Math.log(15) - lr)
+        - P.dMom24 * v24 * Math.min(h, P.dMomHours) / 24 - P.dMom6 * v6 * Math.min(h, 6) / 6;
+      const s = Math.sqrt(P.dS0 * P.dS0 + P.dS1 * P.dS1 * h);
+      let lo = 0;
+      for (let k = 0; k < PLACES; k++) {
+        const hi = phi((Math.log(k + 1.5) - m) / s);
+        acc[k] += hi - lo;
+        lo = hi;
+      }
+      n++;
+    }
+    for (let k = 0; k < PLACES; k++) acc[k] /= n;
+    out.set(id, acc);
+  }
+  return out;
 }
 
 /** Mean place shares by origin-rank bucket (1, 2, ..., 10, 11-15, 16-25, 26-50, 51+), smoothed toward uniform. */

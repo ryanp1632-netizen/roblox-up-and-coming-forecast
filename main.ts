@@ -52,6 +52,15 @@ export const DEFAULTS = {
   regTail: 0.2, // share of a 2.5x wider Gaussian, for heavy tails
   capFrom: 0.12, // a place's share above this is shrunk...
   capSlope: 0.5, // ...to this fraction of its excess (1 = no cap)
+  // The chart lists games published in the last 28 days: a game leaves it once its age passes 28 days plus the
+  // delay between creating and publishing it. Hourly exit hazard by days since `created` (games/v1 details),
+  // measured on the public archive's top-50 games: none before 28 days, about 1-2 % an hour from 28.5 to 31 days
+  // (most games are published within a few days of being created), then about 0.5 % an hour.
+  hazardAges: [28.25, 28.75, 29.25, 31], // each segment starts at this age (days)...
+  hazardRates: [0.006, 0.012, 0.017, 0.005], // ...and has this hourly exit rate; none before the first
+  hazardScale: 0.5, // multiplier on the hazard (0 = ignore ages)
+  ageShift: 0.2, // extra log-rank sink per 48 h for a game 26.5-31 days past `created` (drift component)
+  ageLateShare: 0.5, // share of that sink for a game 31-40 days past `created`
 };
 
 /** Parses history.ndjson text into reads sorted by time: {t (hours), ids (in rank order), rank Map, playing Map}. */
@@ -74,7 +83,15 @@ export function parseHistory(text) {
       rank.set(id, ids.length);
       if (Number.isFinite(r.playing) && r.playing > 0) playing.set(id, r.playing);
     }
-    reads.push({ t: Date.parse(o.at) / 3600000, at: o.at, ids, rank, playing });
+    // creation times (hours) from the read's games/v1 details, where the read carries them
+    const created = new Map();
+    if (o.details && typeof o.details === 'object') {
+      for (const [k, d] of Object.entries(o.details)) {
+        const c = d && typeof d.created === 'string' ? Date.parse(d.created) : NaN;
+        if (Number.isFinite(c)) created.set(Number(k), c / 3600000);
+      }
+    }
+    reads.push({ t: Date.parse(o.at) / 3600000, at: o.at, ids, rank, playing, created });
   }
   reads.sort((a, b) => a.t - b.t);
   return reads;
@@ -252,7 +269,43 @@ export function forecast(reads, params = DEFAULTS) {
       for (let k = 0; k < PLACES; k++) a[k] = (1 - P.mixReg) * a[k] + P.mixReg * d[k] * (1 - poolP[k]);
     }
   }
+  if (P.hazardScale > 0) {
+    // scale each game by its expected share of the window still on the chart; places are re-normalised in finish
+    const created = createdTimes(reads);
+    for (const id of ids) {
+      const c = created.get(id);
+      if (c === undefined) continue;
+      const s = meanSurvival((origin.t - c) / 24, P);
+      const a = prob.get(id);
+      for (let k = 0; k < PLACES; k++) a[k] *= s;
+    }
+  }
   return finish(ids, prob, poolP, P);
+}
+
+/** Every game's creation time (hours) found in any read's details. */
+function createdTimes(reads) {
+  const out = new Map();
+  for (const r of reads) for (const [id, c] of r.created) out.set(id, c);
+  return out;
+}
+
+/** Hourly exit hazard at an age in days. */
+function hazardAt(ageDays, P) {
+  let rate = 0;
+  for (let i = 0; i < P.hazardAges.length; i++) if (ageDays >= P.hazardAges[i]) rate = P.hazardRates[i];
+  return rate * P.hazardScale;
+}
+
+/** The mean, over the window's hours 1..72, of the chance a game now `ageDays` old is still on the chart. */
+export function meanSurvival(ageDays, P) {
+  let logS = 0;
+  let sum = 0;
+  for (let h = 1; h <= 72; h++) {
+    logS -= hazardAt(ageDays + (h - 0.5) / 24, P);
+    sum += Math.exp(logS);
+  }
+  return sum / 72;
 }
 
 const REG_HORIZONS = [3, 12, 24, 48, 72];
@@ -328,6 +381,7 @@ export function fitDrift(reads, P) {
 /** The regression's place probabilities for each game, averaged over the window's hours (two-Gaussian tails). */
 function regressionDiffusion(reads, ids, feats, P) {
   const fits = fitDrift(reads, P);
+  const created = createdTimes(reads);
   // nodes: horizon 0 (no move, a small spread) and every horizon with a fit
   const nodes = [{ H: 0, beta: null, sd: P.regS0 }];
   for (const f of fits) if (f) nodes.push(f);
@@ -335,6 +389,9 @@ function regressionDiffusion(reads, ids, feats, P) {
   for (const id of ids) {
     const x = regX(feats.get(id));
     const lr = feats.get(id)[0];
+    const cr = created.get(id);
+    const ageNow = cr === undefined ? null : (reads[reads.length - 1].t - cr) / 24;
+    const ageW = ageNow === null ? 0 : ageNow >= 26.5 && ageNow < 31 ? 1 : ageNow >= 31 && ageNow < 40 ? P.ageLateShare : 0;
     const mu = nodes.map((n) => (n.beta ? n.beta.reduce((s, v, a) => s + v * x[a], 0) : 0));
     const acc = new Float64Array(PLACES);
     let cnt = 0;
@@ -344,7 +401,7 @@ function regressionDiffusion(reads, ids, feats, P) {
       const n0 = nodes[a];
       const n1 = nodes[Math.min(a + 1, nodes.length - 1)];
       const u = n1.H > n0.H ? Math.min(1, Math.max(0, (h - n0.H) / (n1.H - n0.H))) : 0;
-      const m = lr + (1 - u) * mu[a] + u * mu[Math.min(a + 1, nodes.length - 1)];
+      const m = lr + (1 - u) * mu[a] + u * mu[Math.min(a + 1, nodes.length - 1)] + P.ageShift * ageW * Math.min(h, 72) / 48;
       const s = P.regSdScale * ((1 - u) * n0.sd + u * n1.sd);
       let lo = 0;
       for (let k = 0; k < PLACES; k++) {

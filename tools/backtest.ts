@@ -65,11 +65,12 @@ export function windowTargets(reads, i) {
 
 export function backtest(reads, params, opts = {}) {
   const from = opts.from ? Date.parse(opts.from) / 3600000 : -Infinity;
+  const to = opts.to ? Date.parse(opts.to) / 3600000 : Infinity;
   const minSpan = opts.minSpan ?? 48;
   const tEnd = reads[reads.length - 1].t;
   const res = [];
   for (let i = 1; i < reads.length - 1; i++) {
-    if (reads[i].t < from || tEnd - reads[i].t < minSpan) continue;
+    if (reads[i].t < from || reads[i].t >= to || tEnd - reads[i].t < minSpan) continue;
     const T = windowTargets(reads, i);
     if (T.length === 0) continue;
     const hist = reads.slice(0, i + 1);
@@ -90,7 +91,7 @@ if (import.meta.url.endsWith('/tools/backtest.ts') && process.argv[1] && process
   const get = (k) => { const i = args.indexOf(k); return i >= 0 ? args[i + 1] : undefined; };
   const params = { ...DEFAULTS, ...(get('--params') ? JSON.parse(get('--params')) : {}) };
   const reads = parseHistory(readFileSync(file, 'utf8'));
-  const r = backtest(reads, params, { from: get('--from'), minSpan: get('--min-span') ? Number(get('--min-span')) : undefined });
+  const r = backtest(reads, params, { from: get('--from'), to: get('--to'), minSpan: get('--min-span') ? Number(get('--min-span')) : undefined });
   if (!args.includes('--quiet')) for (const x of r.rows) console.log(x.at, x.n, x.score.toFixed(3), x.base.toFixed(3));
   console.log(`origins ${r.rows.length}  model ${r.score.toFixed(4)}  baseline ${r.base.toFixed(4)}`);
 }

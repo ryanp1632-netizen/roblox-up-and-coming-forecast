@@ -85,10 +85,17 @@ export function parseHistory(text) {
     }
     // creation times (hours) from the read's games/v1 details, where the read carries them
     const created = new Map();
-    if (o.details && typeof o.details === 'object') {
-      for (const [k, d] of Object.entries(o.details)) {
-        const c = d && typeof d.created === 'string' ? Date.parse(d.created) : NaN;
-        if (Number.isFinite(c)) created.set(Number(k), c / 3600000);
+    // (an object keyed by universe id, an array of games/v1 entries, or a raw games/v1 response {data: [...]})
+    let det = o.details;
+    if (det && typeof det === 'object' && !Array.isArray(det) && Array.isArray(det.data)) det = det.data;
+    if (det && typeof det === 'object') {
+      for (const [k, d] of Object.entries(det)) {
+        if (!d || typeof d !== 'object') continue;
+        const cs = d.created ?? d.created_at ?? d.createdAt;
+        const c = typeof cs === 'string' ? Date.parse(cs) : NaN;
+        const idRaw = Array.isArray(det) ? (d.id ?? d.universe_id ?? d.universeId) : (d.universe_id ?? d.universeId ?? k);
+        const id = Number(idRaw);
+        if (Number.isFinite(c) && Number.isFinite(id)) created.set(id, c / 3600000);
       }
     }
     reads.push({ t: Date.parse(o.at) / 3600000, at: o.at, ids, rank, playing, created });

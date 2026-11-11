@@ -36,7 +36,7 @@ export const DEFAULTS = {
   poolFloor: 0.04, // least unnamed share of a place
   poolScale: 1.3, // multiplier on the learned unnamed share
   temp: 1.0, // power applied to the named probabilities before normalising (1 = none)
-  mixDiffusion: 0.5, // weight of the parametric log-rank diffusion component
+  mixDiffusion: 0.3, // weight of the parametric log-rank diffusion component
   dDrift: 0.02, // log-rank drift per hour (games sink as they age)
   dMeanRev: 0.4, // pull toward rank 15 over a day
   dMom24: 0.5, // share of the last 24 h log-rank change that carries on
@@ -44,6 +44,12 @@ export const DEFAULTS = {
   dMom6: 0.2, // share of the last 6 h change that carries on (over 6 h)
   dS0: 0.25, // log-rank spread at horizon 0
   dS1: 0.12, // and its growth per sqrt(hour)
+  mixReg: 0.5, // weight of the regression-fitted drift component
+  regMaxRank: 100, // games ranked below this are left out of the drift fit
+  regRidge: 0.001, // ridge penalty, per unit of weight
+  regS0: 0.05, // log-rank spread at horizon 0
+  regSdScale: 0.9, // multiplier on the fitted spreads
+  regTail: 0.2, // share of a 2.5x wider Gaussian, for heavy tails
 };
 
 /** Parses history.ndjson text into reads sorted by time: {t (hours), ids (in rank order), rank Map, playing Map}. */
@@ -235,7 +241,120 @@ export function forecast(reads, params = DEFAULTS) {
       for (let k = 0; k < PLACES; k++) a[k] = (1 - P.mixDiffusion) * a[k] + P.mixDiffusion * d[k] * (1 - poolP[k]);
     }
   }
+  if (P.mixReg > 0) {
+    const reg = regressionDiffusion(reads, ids, feats, P);
+    for (const id of ids) {
+      const a = prob.get(id);
+      const d = reg.get(id);
+      for (let k = 0; k < PLACES; k++) a[k] = (1 - P.mixReg) * a[k] + P.mixReg * d[k] * (1 - poolP[k]);
+    }
+  }
   return finish(ids, prob, poolP, P);
+}
+
+const REG_HORIZONS = [3, 12, 24, 48, 72];
+
+/** Solves (A + lambda I) x = b by Gauss-Jordan elimination (A symmetric positive semi-definite, small). */
+function ridgeSolve(A, b, lambda) {
+  const n = b.length;
+  const M = A.map((row, i) => [...row.map((v, j) => v + (i === j && i > 0 ? lambda : 0)), b[i]]);
+  for (let c = 0; c < n; c++) {
+    let p = c;
+    for (let r = c + 1; r < n; r++) if (Math.abs(M[r][c]) > Math.abs(M[p][c])) p = r;
+    [M[c], M[p]] = [M[p], M[c]];
+    const d = M[c][c] || 1e-12;
+    for (let r = 0; r < n; r++) {
+      if (r === c) continue;
+      const f = M[r][c] / d;
+      if (f !== 0) for (let k = c; k <= n; k++) M[r][k] -= f * M[c][k];
+    }
+  }
+  return M.map((row, i) => row[n] / (row[i] || 1e-12));
+}
+
+function regX(f) {
+  return [1, f[0] - Math.log(10), f[1], f[2], f[3], f[4] - 4, f[5]];
+}
+
+/**
+ * Fits, from the history itself, how a game's log rank moves over 3, 12, 24, 48 and 72 hours: a ridge regression of
+ * the change on its features (rank, rank velocity, player growth, chart age, distance below peak), and the spread of
+ * what it leaves unexplained. Games that left the chart count as rank 130.
+ */
+export function fitDrift(reads, P) {
+  const fits = [];
+  const featCache = new Map();
+  const featOf = (i) => { if (!featCache.has(i)) featCache.set(i, featuresAt(reads, i)); return featCache.get(i); };
+  const maxLr = Math.log(P.regMaxRank);
+  for (const H of REG_HORIZONS) {
+    const tol = Math.max(1.5, 0.2 * H);
+    const A = Array.from({ length: 7 }, () => new Array(7).fill(0));
+    const b = new Array(7).fill(0);
+    const rows = [];
+    for (let i = 0; i < reads.length - 1; i++) {
+      let j = -1;
+      let bd = Infinity;
+      for (let k = i + 1; k < reads.length; k++) {
+        const d = reads[k].t - reads[i].t - H;
+        if (d > tol) break;
+        if (Math.abs(d) <= tol && Math.abs(d) < bd) { bd = Math.abs(d); j = k; }
+      }
+      if (j < 0) continue;
+      const w = i === 0 ? P.originGapCap : Math.min(P.originGapCap, Math.max(0.25, reads[i].t - reads[i - 1].t));
+      const F = featOf(i);
+      for (const id of reads[i].ids) {
+        const f = F.get(id);
+        if (f[0] > maxLr) continue;
+        const x = regX(f);
+        const y = lnRank(reads[j], id) - f[0];
+        rows.push([x, y, w]);
+        for (let a = 0; a < 7; a++) { b[a] += w * x[a] * y; for (let c = 0; c < 7; c++) A[a][c] += w * x[a] * x[c]; }
+      }
+    }
+    if (rows.length < 60) { fits.push(null); continue; }
+    const wsum = rows.reduce((s, r) => s + r[2], 0);
+    const beta = ridgeSolve(A, b, P.regRidge * wsum);
+    let ad = 0;
+    for (const [x, y, w] of rows) { let yh = 0; for (let a = 0; a < 7; a++) yh += x[a] * beta[a]; ad += w * Math.abs(y - yh); }
+    fits.push({ H, beta, sd: 1.2533 * ad / wsum });
+  }
+  return fits;
+}
+
+/** The regression's place probabilities for each game, averaged over the window's hours (two-Gaussian tails). */
+function regressionDiffusion(reads, ids, feats, P) {
+  const fits = fitDrift(reads, P);
+  // nodes: horizon 0 (no move, a small spread) and every horizon with a fit
+  const nodes = [{ H: 0, beta: null, sd: P.regS0 }];
+  for (const f of fits) if (f) nodes.push(f);
+  const out = new Map();
+  for (const id of ids) {
+    const x = regX(feats.get(id));
+    const lr = feats.get(id)[0];
+    const mu = nodes.map((n) => (n.beta ? n.beta.reduce((s, v, a) => s + v * x[a], 0) : 0));
+    const acc = new Float64Array(PLACES);
+    let cnt = 0;
+    for (let h = 1.5; h < 72; h += 3) {
+      let a = 0;
+      while (a < nodes.length - 2 && nodes[a + 1].H < h) a++;
+      const n0 = nodes[a];
+      const n1 = nodes[Math.min(a + 1, nodes.length - 1)];
+      const u = n1.H > n0.H ? Math.min(1, Math.max(0, (h - n0.H) / (n1.H - n0.H))) : 0;
+      const m = lr + (1 - u) * mu[a] + u * mu[Math.min(a + 1, nodes.length - 1)];
+      const s = P.regSdScale * ((1 - u) * n0.sd + u * n1.sd);
+      let lo = 0;
+      for (let k = 0; k < PLACES; k++) {
+        const z = Math.log(k + 1.5) - m;
+        const hi = (1 - P.regTail) * phi(z / s) + P.regTail * phi(z / (2.5 * s));
+        acc[k] += hi - lo;
+        lo = hi;
+      }
+      cnt++;
+    }
+    for (let k = 0; k < PLACES; k++) acc[k] /= cnt;
+    out.set(id, acc);
+  }
+  return out;
 }
 
 /** Standard normal CDF (Abramowitz-Stegun 7.1.26 on erf; error below 1.5e-7). */

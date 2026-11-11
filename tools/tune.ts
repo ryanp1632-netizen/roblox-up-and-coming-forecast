@@ -35,6 +35,12 @@ const grid = {
   dMom6: [0, 0.2, 0.5],
   dS0: [0.1, 0.25, 0.4, 0.6],
   dS1: [0.06, 0.09, 0.12, 0.18, 0.25],
+  mixReg: [0, 0.2, 0.35, 0.5, 0.65],
+  regMaxRank: [30, 60, 100],
+  regRidge: [0.001, 0.01, 0.05],
+  regS0: [0.05, 0.15, 0.3],
+  regSdScale: [0.8, 0.9, 1.0, 1.1],
+  regTail: [0, 0.1, 0.2, 0.35],
 };
 const only = get('--only') ? get('--only').split(',') : null;
 for (let r = 0; r < rounds; r++) {

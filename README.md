@@ -6,8 +6,9 @@
 
 A deterministic, standard-library-only forecaster of Roblox's Up-and-Coming top 10 over the next 72 hours. It learns
 the chart's own churn from its history: a nearest-neighbour kernel over past games with a similar rank, rank velocity,
-player growth and chart age, blended with a log-rank drift-and-spread model, plus a learned share for games not yet
-on the chart, every probability floored so no plausible outcome is ruled out.
+player growth and chart age, blended with two log-rank drift-and-spread models (one whose drift and spread are
+fitted by ridge regression on the history at run time), plus a learned share for games not yet on the chart, every
+probability floored so no plausible outcome is ruled out.
 
 - `main.ts` reads `/input/history.ndjson` (or `$MAKEFUN_INPUT_DIR`) and writes `/output/forecast.json` (or `$MAKEFUN_OUTPUT_DIR`).
 - `tools/backtest.ts` replays the history walk-forward and scores every origin with the contest's exact log score,

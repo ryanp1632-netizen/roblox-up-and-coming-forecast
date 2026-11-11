@@ -71,8 +71,11 @@ export function parseHistory(text) {
     let o;
     try { o = JSON.parse(line); } catch { continue; }
     if (!o || o.ok === false || !Array.isArray(o.up_and_coming) || o.up_and_coming.length === 0) continue;
-    const rows = [...o.up_and_coming].filter((r) => r && Number.isFinite(r.rank) && Number.isFinite(Number(r.universe_id)));
-    rows.sort((a, b) => a.rank - b.rank);
+    const t = Date.parse(o.at) / 3600000;
+    if (!Number.isFinite(t)) continue;
+    const rows = o.up_and_coming.filter((r) => r && Number.isFinite(Number(r.rank)) && Number.isInteger(Number(r.universe_id)) && Number(r.universe_id) > 0);
+    rows.sort((a, b) => Number(a.rank) - Number(b.rank));
+    if (rows.length === 0) continue;
     const ids = [];
     const rank = new Map();
     const playing = new Map();
@@ -81,7 +84,8 @@ export function parseHistory(text) {
       if (rank.has(id)) continue;
       ids.push(id);
       rank.set(id, ids.length);
-      if (Number.isFinite(r.playing) && r.playing > 0) playing.set(id, r.playing);
+      const pl = Number(r.playing);
+      if (Number.isFinite(pl) && pl > 0) playing.set(id, pl);
     }
     // creation times (hours) from the read's games/v1 details, where the read carries them
     const created = new Map();
@@ -98,10 +102,13 @@ export function parseHistory(text) {
         if (Number.isFinite(c) && Number.isFinite(id)) created.set(id, c / 3600000);
       }
     }
-    reads.push({ t: Date.parse(o.at) / 3600000, at: o.at, ids, rank, playing, created });
+    reads.push({ t, at: o.at, ids, rank, playing, created });
   }
   reads.sort((a, b) => a.t - b.t);
-  return reads;
+  // drop truncated reads (under half the median chart length), so a partial last read can't collapse the forecast
+  const lens = reads.map((r) => r.ids.length).sort((a, b) => a - b);
+  const median = lens.length ? lens[lens.length >> 1] : 0;
+  return reads.filter((r) => r.ids.length >= median / 2);
 }
 
 function lnRank(read, id) {
@@ -538,8 +545,51 @@ function main() {
   let task = { places: PLACES, output: 'forecast.json' };
   try { task = { ...task, ...JSON.parse(readFileSync(join(inDir, 'task.json'), 'utf8')) }; } catch {}
   const reads = parseHistory(readFileSync(join(inDir, 'history.ndjson'), 'utf8'));
-  const { probabilities, top10 } = forecast(reads, DEFAULTS);
-  writeFileSync(join(outDir, task.output || 'forecast.json'), JSON.stringify({ probabilities, top10 }) + '\n');
+  writeFileSync(join(outDir, task.output || 'forecast.json'), JSON.stringify(safeForecast(reads)) + '\n');
+}
+
+/** Checks a forecast against the output contract: <= 100 rows a place, each place's p summing to <= 1, 10 distinct ids. */
+function valid(f) {
+  if (!f || !Array.isArray(f.probabilities) || !Array.isArray(f.top10) || f.top10.length !== PLACES) return false;
+  if (new Set(f.top10).size !== PLACES || !f.top10.every((id) => Number.isInteger(id) && id > 0)) return false;
+  const sum = new Array(PLACES + 1).fill(0);
+  const n = new Array(PLACES + 1).fill(0);
+  for (const r of f.probabilities) {
+    if (!r || !Number.isInteger(r.place) || r.place < 1 || r.place > PLACES || !Number.isInteger(r.universe_id)) return false;
+    if (!Number.isFinite(r.p) || r.p < 0) return false;
+    sum[r.place] += r.p;
+    n[r.place] += 1;
+  }
+  return sum.every((x) => x <= 1 + 1e-9) && n.every((x) => x <= 100);
+}
+
+/** The house-style persistence forecast for the last read: the fallback if every model path fails. */
+function persistenceForecast(reads) {
+  const chart = reads.length ? reads[reads.length - 1].ids : [];
+  const probabilities = [];
+  for (let place = 1; place <= PLACES && place <= chart.length; place++) {
+    const near = [[chart[place - 1], 0.5], [chart[place - 2], 0.15], [chart[place], 0.15]];
+    for (const [id, p] of near) if (id !== undefined) probabilities.push({ universe_id: id, place, p });
+  }
+  const top10 = chart.slice(0, PLACES);
+  for (let k = 1; top10.length < PLACES; k++) if (!top10.includes(k)) top10.push(k);
+  return { probabilities, top10 };
+}
+
+/** The full model, then simpler variants if it throws or breaks the contract, then persistence: always some output. */
+export function safeForecast(reads) {
+  const tries = [
+    () => forecast(reads, DEFAULTS),
+    () => forecast(reads.map((r) => ({ ...r, created: new Map() })), { ...DEFAULTS, hazardScale: 0, ageShift: 0 }),
+    () => forecast(reads, { ...DEFAULTS, hazardScale: 0, ageShift: 0, mixReg: 0, mixDiffusion: 0 }),
+  ];
+  for (const attempt of tries) {
+    try {
+      const f = attempt();
+      if (valid(f)) return { probabilities: f.probabilities, top10: f.top10 };
+    } catch {}
+  }
+  return persistenceForecast(reads);
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) main();

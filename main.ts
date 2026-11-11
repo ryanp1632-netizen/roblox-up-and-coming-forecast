@@ -50,6 +50,8 @@ export const DEFAULTS = {
   regS0: 0.05, // log-rank spread at horizon 0
   regSdScale: 0.9, // multiplier on the fitted spreads
   regTail: 0.2, // share of a 2.5x wider Gaussian, for heavy tails
+  capFrom: 0.12, // a place's share above this is shrunk...
+  capSlope: 0.5, // ...to this fraction of its excess (1 = no cap)
 };
 
 /** Parses history.ndjson text into reads sorted by time: {t (hours), ids (in rank order), rank Map, playing Map}. */
@@ -417,6 +419,24 @@ export function finish(ids, prob, poolP, P) {
     let raw = ids.map((id) => Math.pow(Math.max(prob.get(id)[k], 1e-9), P.temp));
     let s = raw.reduce((a, b) => a + b, 0);
     const named = 1 - pool;
+    // soft cap: a share above capFrom keeps only capSlope of its excess, the rest goes to the other games
+    if (P.capSlope < 1) {
+      let cut = 0;
+      let restSum = 0;
+      for (let n = 0; n < raw.length; n++) {
+        const q = (raw[n] / s) * named;
+        if (q > P.capFrom) {
+          const q2 = P.capFrom + (q - P.capFrom) * P.capSlope;
+          cut += q - q2;
+          raw[n] = (q2 / named) * s;
+        } else restSum += raw[n];
+      }
+      if (cut > 0 && restSum > 0) {
+        const scale = 1 + (cut / named) * s / restSum;
+        for (let n = 0; n < raw.length; n++) if ((raw[n] / s) * named <= P.capFrom) raw[n] *= scale;
+      }
+      s = raw.reduce((a, b) => a + b, 0);
+    }
     // floor every named game, then scale the rest to fill the named mass
     const fl = Math.min(P.floor, named / ids.length / 2);
     const free = named - fl * ids.length;
